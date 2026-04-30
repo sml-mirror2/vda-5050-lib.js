@@ -383,6 +383,16 @@ export interface AgvAdapter {
     detach(context: DetachContext): void;
 
     /**
+     * Callback for connection state changes
+     * @param connectionState Current connection state
+     * @param previousConnectionState Previous connection state
+     */
+    onConnectionStateChange?(
+        connectionState: "online" | "offline" | "broken",
+        previousConnectionState: "online" | "offline" | "broken",
+    ): void;
+
+    /**
      * Registers a handler that is invoked by the associated controller to check
      * synchronously whether a given node, edge, or instant action can be
      * executed principally.
@@ -1178,6 +1188,7 @@ export class AgvController extends AgvClient {
             // this is not called on the initial connection because it is registered after we connect.
             if (connectionState !== previousConnectionState) {
                 this.debug(`connection state changed: ${previousConnectionState} -> ${connectionState}`);
+                this._agvAdapter.onConnectionStateChange?.(connectionState, previousConnectionState);
                 if (connectionState === "online") {
                     // only called on reconnect
                     this.debug("Connection online again.");
