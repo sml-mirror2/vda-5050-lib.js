@@ -1184,12 +1184,20 @@ export class AgvController extends AgvClient {
         await this.subscribe(Topic.InstantActions, actions => this._processInstantActions(actions));
 
         // Ensure State and Connection are reported once immediately after client is online again.
+        let firstCallAfterRegister = true;
         this.registerConnectionStateChange((connectionState, previousConnectionState) => {
+            const firstCall = firstCallAfterRegister;
+            firstCallAfterRegister = false;
             // this is not called on the initial connection because it is registered after we connect.
-            if (connectionState !== previousConnectionState) {
-                this.debug(`connection state changed: ${previousConnectionState} -> ${connectionState}`);
+            const connectionStateChanged = connectionState !== previousConnectionState;
+            if (firstCall || connectionStateChanged) {
+                if (firstCall) {
+                    this.debug(`connection state at register: ${previousConnectionState} -> ${connectionState}`);
+                } else if (connectionStateChanged) {
+                    this.debug(`connection state changed: ${previousConnectionState} -> ${connectionState}`);
+                }
                 this._agvAdapter.onConnectionStateChange?.(connectionState, previousConnectionState);
-                if (connectionState === "online") {
+                if (connectionStateChanged && connectionState === "online") {
                     // only called on reconnect
                     this.debug("Connection online again.");
                     this.publishConnectionState(ConnectionState.Online);
