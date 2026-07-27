@@ -10,6 +10,7 @@ import {
     ClientOptions,
     Edge,
     Error,
+    ErrorLevel,
     ErrorType,
     Headerless,
     InstantActions,
@@ -612,48 +613,84 @@ export class MasterController extends MasterControlClient {
             // Ensure lastCache refers to the most recent active base order (if present).
             const lastCache = this._getLastActiveOrderStateCache(cache);
             if (lastCache !== undefined) {
-                // Clear current horizon nodes, append new base and horizon nodes, keeping
-                // end node of current base (might be processing currently). Actions of
-                // first new base node are appended to end node of current base.
+                // The stitch merge below assumes this order *continues* the previous
+                // one: a stitching order shares the previous order's last base node
+                // (the "stitching node") as its own first node, with the same nodeId
+                // and sequenceId (that is why the new base's first node is dropped via
+                // `.slice(1)` below). Verify that precondition holds before merging.
                 let lastHorizonStartIndex = lastCache.combinedOrder.nodes.findIndex(n => !n.released);
                 const lastBaseEnd = lastCache.combinedOrder.nodes[lastHorizonStartIndex === -1 ?
                     lastCache.combinedOrder.nodes.length - 1 : lastHorizonStartIndex - 1];
-                const newFirstNodeActions = cache.combinedOrder.nodes[0].actions;
-                cache.combinedOrder.nodes = lastCache.combinedOrder.nodes
-                    .slice(0, lastHorizonStartIndex === -1 ? undefined : lastHorizonStartIndex)
-                    .concat(cache.combinedOrder.nodes.slice(1));
+                const newFirstNode = cache.combinedOrder.nodes[0];
+                const isContinuation = lastBaseEnd !== undefined &&
+                    newFirstNode.nodeId === lastBaseEnd.nodeId &&
+                    newFirstNode.sequenceId === lastBaseEnd.sequenceId;
 
-                // Note that the current end node remains reference equal (for event
-                // handlers) but its actions also contain the stitched actions.
-                lastBaseEnd.actions = lastBaseEnd.actions.concat(newFirstNodeActions);
+                if (!isContinuation) {
+                    // Not a stitching order: this is an independent fresh order that
+                    // merely happens to be assigned while a previous order is still
+                    // tracked - typically because the AGV restarted and abandoned the
+                    // previous order without ever reporting it terminated, so its cache
+                    // lingered. Merging would poison this order's completion, because
+                    // `_isOrderProcessed` could never become true (the stale order's
+                    // actions never reach a terminal state in this order's State
+                    // stream). Finalize the defunct previous order and track this one
+                    // on its own instead.
+                    this.debug("order %s is not a stitch onto %s (first node %o != previous base end %o); finalizing abandoned previous order",
+                        cache.order.orderId, lastCache.order.orderId, newFirstNode, lastBaseEnd);
+                    if (!lastCache.isOrderProcessedHandlerInvoked) {
+                        this._removeOrderStateCache(lastCache, true);
+                        lastCache.isOrderProcessedHandlerInvoked = true;
+                        lastCache.eventHandler.onOrderProcessed(
+                            {
+                                errorType: ErrorType.Order,
+                                errorLevel: ErrorLevel.Warning,
+                                errorDescription: "Order superseded by a non-continuous order",
+                            }, false, false,
+                            { order: lastCache.order, agvId: lastCache.agvId, state });
+                    }
+                    cache.lastCache = undefined;
+                } else {
+                    // Clear current horizon nodes, append new base and horizon nodes, keeping
+                    // end node of current base (might be processing currently). Actions of
+                    // first new base node are appended to end node of current base.
+                    const newFirstNodeActions = newFirstNode.actions;
+                    cache.combinedOrder.nodes = lastCache.combinedOrder.nodes
+                        .slice(0, lastHorizonStartIndex === -1 ? undefined : lastHorizonStartIndex)
+                        .concat(cache.combinedOrder.nodes.slice(1));
 
-                // Clear current horizon edges, append new base and horizon edges.
-                lastHorizonStartIndex = lastCache.combinedOrder.edges.findIndex(n => !n.released);
-                cache.combinedOrder.edges = lastCache.combinedOrder.edges
-                    .slice(0, lastHorizonStartIndex === -1 ? undefined : lastHorizonStartIndex)
-                    .concat(cache.combinedOrder.edges);
+                    // Note that the current end node remains reference equal (for event
+                    // handlers) but its actions also contain the stitched actions.
+                    lastBaseEnd.actions = lastBaseEnd.actions.concat(newFirstNodeActions);
 
-                // Update reference to last traversed node as it could contain stitched
-                // actions if it is the end node of the current base.
-                cache.lastNodeTraversed = cache.combinedOrder.nodes.find(n =>
-                    n.nodeId === lastCache.lastNodeTraversed?.nodeId && n.sequenceId === lastCache.lastNodeTraversed?.sequenceId);
-                cache.lastEdgeStateChanges = lastCache.lastEdgeStateChanges;
-                cache.edgeStateChangeInvocations = lastCache.edgeStateChangeInvocations;
-                cache.lastEdgeProcessed = lastCache.lastEdgeProcessed;
+                    // Clear current horizon edges, append new base and horizon edges.
+                    lastHorizonStartIndex = lastCache.combinedOrder.edges.findIndex(n => !n.released);
+                    cache.combinedOrder.edges = lastCache.combinedOrder.edges
+                        .slice(0, lastHorizonStartIndex === -1 ? undefined : lastHorizonStartIndex)
+                        .concat(cache.combinedOrder.edges);
 
-                // Assume both orders have unique node/edge actionIds. Note that
-                // onActionChanged events on nodes/edges of old actions are reported
-                // with the old target (node/edge) reference, while events on
-                // nodes/edges of new actions (including first stitching base node) are
-                // reported on the new target (node/edge reference).
-                cache.mappedActions = new Map([...lastCache.mappedActions, ...cache.mappedActions]);
-                cache.lastActionStates = lastCache.lastActionStates;
+                    // Update reference to last traversed node as it could contain stitched
+                    // actions if it is the end node of the current base.
+                    cache.lastNodeTraversed = cache.combinedOrder.nodes.find(n =>
+                        n.nodeId === lastCache.lastNodeTraversed?.nodeId && n.sequenceId === lastCache.lastNodeTraversed?.sequenceId);
+                    cache.lastEdgeStateChanges = lastCache.lastEdgeStateChanges;
+                    cache.edgeStateChangeInvocations = lastCache.edgeStateChangeInvocations;
+                    cache.lastEdgeProcessed = lastCache.lastEdgeProcessed;
 
-                this.debug("stitching current order onto active order with combined cache %j", cache);
+                    // Assume both orders have unique node/edge actionIds. Note that
+                    // onActionChanged events on nodes/edges of old actions are reported
+                    // with the old target (node/edge) reference, while events on
+                    // nodes/edges of new actions (including first stitching base node) are
+                    // reported on the new target (node/edge reference).
+                    cache.mappedActions = new Map([...lastCache.mappedActions, ...cache.mappedActions]);
+                    cache.lastActionStates = lastCache.lastActionStates;
 
-                // Cache of last order and previous orders can be removed as all
-                // subsequent state events are emitted on the stitched order.
-                this._removeOrderStateCache(lastCache, true);
+                    this.debug("stitching current order onto active order with combined cache %j", cache);
+
+                    // Cache of last order and previous orders can be removed as all
+                    // subsequent state events are emitted on the stitched order.
+                    this._removeOrderStateCache(lastCache, true);
+                }
             }
         }
 
