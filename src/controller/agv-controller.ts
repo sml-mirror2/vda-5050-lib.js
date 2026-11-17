@@ -1159,7 +1159,7 @@ export class AgvController extends AgvClient {
                 // trigger initial instant actions or orders.
                 this.updatePartialState(initialState, false);
                 await this._subscribeOnStarted();
-                this._publishCurrentState();
+                if (this.isStarted) { this._publishCurrentState(); }
             },
         });
     }
@@ -1181,7 +1181,10 @@ export class AgvController extends AgvClient {
     private async _subscribeOnStarted() {
         // First, subscribe to orders and instant actions.
         await this.subscribe(Topic.Order, order => this._processOrder(order));
+        // stop() may complete while a subscription acknowledgement is pending.
+        if (!this.isStarted) { return; }
         await this.subscribe(Topic.InstantActions, actions => this._processInstantActions(actions));
+        if (!this.isStarted) { return; }
 
         // Ensure State and Connection are reported once immediately after client is online again.
         let firstCallAfterRegister = true;

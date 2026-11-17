@@ -141,6 +141,9 @@ export interface MqttTransportOptions {
      */
     brokerUrl: string;
 
+    /** Opt in to indefinite, bounded transport recovery without controller restart. */
+    recoverForever?: boolean;
+
     /**
      * Defines the MQTT topic structure as a formatted string with placeholders
      * according to the VDA 5050 protocol specification (optional).
@@ -403,6 +406,14 @@ export abstract class Client {
     public readonly debug: Debug.Debugger;
 
     private _mqtt: Mqtt;
+    private _startPromise: Promise<void>;
+    private _recovering = false;
+    private _transportGeneration = 0;
+    private _recoveryTimer: ReturnType<typeof setTimeout>;
+    private _recoveryDeadline: ReturnType<typeof setTimeout>;
+    private _recoveryOptions: IClientOptions;
+    private _initialResolve: () => void;
+    private _initialReject: (error: Error) => void;
     private _isStarted: boolean;
     private _isStopping: boolean;
     private _connectionState: "online" | "offline" | "broken";
@@ -477,13 +488,34 @@ export abstract class Client {
      * rejected when connection fails
      */
     async start() {
-        if (this._isStarted) {
-            return;
+        if (this._isStarted) { return; }
+        if (this._startPromise) { return this._startPromise; }
+        this._startPromise = (async () => {
+            await this._connect();
+            if (this.clientOptions.transport.recoverForever && !this._recovering) {
+                throw new Error("Client stopped during connection");
+            }
+            this._isStarted = true;
+            await this.onStarted();
+        })();
+        try {
+            await this._startPromise;
+        } finally {
+            this._startPromise = undefined;
         }
-        this.debug("Starting client");
-        await this._connect();
-        this._isStarted = true;
-        await this.onStarted();
+    }
+
+    /**
+     * Update the live recovery destination without stopping the controller or adapter.
+     * Pending updates supersede previous attempts. Requires recoverForever.
+     */
+    updateBrokerUrl(brokerUrl: string): void {
+        if (!this.clientOptions.transport.recoverForever) {
+            throw new Error("Broker updates require recoverForever");
+        }
+        if (brokerUrl === this._clientOptions.transport.brokerUrl) { return; }
+        this._clientOptions.transport.brokerUrl = brokerUrl;
+        if (this._recovering) { this._recoverTransport(); }
     }
 
     /**
@@ -503,10 +535,27 @@ export abstract class Client {
      * underlying MQTT transport.
      */
     async stop() {
-        if (!this._isStarted || this._isStopping) {
+        if (this._isStopping) { return; }
+        if (this.clientOptions.transport.recoverForever) {
+            this._isStopping = true;
+            this._recovering = false;
+            ++this._transportGeneration;
+            clearTimeout(this._recoveryTimer);
+            clearTimeout(this._recoveryDeadline);
+            this._initialReject?.(new Error("Client stopped during connection"));
+            this._initialResolve = this._initialReject = undefined;
+            try {
+                if (this._isStarted) { await this.onStopping(); }
+            } finally {
+                this._isStarted = false;
+                await this._endRecoveryTransport();
+                this.reset();
+                this._emitConnectionStateChange("offline");
+                this._isStopping = false;
+            }
             return;
         }
-        this.debug("Stopping client");
+        if (!this._isStarted) { return; }
         this._isStopping = true;
         await this.onStopping();
         this._isStarted = false;
@@ -545,7 +594,7 @@ export abstract class Client {
                 return;
             }
 
-            if (!this._mqtt.connected) {
+            if (!this._mqtt?.connected) {
                 this.debug("Unsubscribe on MQTT topic %s for id %s while offline", mqttTopic, subscriptionId);
                 // Do not mqtt.unsubscribe as resubscriptions are handled on reconnect.
                 resolve();
@@ -745,8 +794,8 @@ export abstract class Client {
         return new Promise((resolve, reject) => {
             const mqttOptions: IClientPublishOptions = this._withMqttProperties({ retain: options?.retainMessage ?? false });
 
-            if (!this._mqtt.connected) {
-                if (options?.dropIfOffline) {
+            if (!this._mqtt?.connected) {
+                if (options?.dropIfOffline || this.clientOptions.transport.recoverForever) {
                     this.debug("Drop offline publish on topic %s", mqttTopic);
                     resolve(undefined);
                     return;
@@ -769,7 +818,13 @@ export abstract class Client {
                         // (i.e. after mqtt.end function has been invoked). Also, a publication
                         // error occurs if sending the MQTT packet fails for some reason.
                         this.debug("Publish on MQTT topic %s failed: %s", mqttTopic, err);
-                        reject(err);
+                        if (this.clientOptions.transport.recoverForever) {
+                            // A connection can disappear between the connected check
+                            // and write completion. Current state is sent on recovery.
+                            resolve(undefined);
+                        } else {
+                            reject(err);
+                        }
                     } else {
                         // Callback fired when the QoS handling completes, or at the next tick if QoS 0.
                         this.debug("Published on MQTT topic %s with retain %s with object %j",
@@ -851,7 +906,7 @@ export abstract class Client {
 
             const mqttOptions: IClientSubscribeOptions = { qos: 0 as QoS, rap: true, rh: 0 };
 
-            if (!this._mqtt.connected) {
+            if (!this._mqtt?.connected) {
                 this.debug("Subscribe on MQTT topic %s with id %s while offline", mqttTopic, id);
                 // Do not mqtt.subscribe as resubscriptions are handled on reconnect.
                 resolve(id);
@@ -866,7 +921,12 @@ export abstract class Client {
                     // error occurs (maybe later on reconnect) if sending the MQTT packet fails
                     // for some reason.
                     this.debug("Subscribe on MQTT topic %s with id %s failed: %s", mqttTopic, id, err);
-                    reject(err);
+                    if (this.clientOptions.transport.recoverForever) {
+                        // The subscription registry survives; retry it on reconnect.
+                        resolve(id);
+                    } else {
+                        reject(err);
+                    }
                 } else {
                     // Callback fired on successful suback.
                     this.debug("Subscribed on MQTT topic %s with id %s", mqttTopic, id);
@@ -1127,6 +1187,16 @@ export abstract class Client {
             will: this._createLastWill(),
         };
 
+        if (transOpts.recoverForever) {
+            this._recovering = true;
+            this._recoveryOptions = { ...mqttOpts, reconnectPeriod: 0, queueQoSZero: false };
+            return new Promise<void>((resolve, reject) => {
+                this._initialResolve = resolve;
+                this._initialReject = reject;
+                this._recoverTransport();
+            });
+        }
+
         let connectionUrl = this.clientOptions.transport.brokerUrl;
         if (this._isWebPlatform) {
             // Ensure websocket protocol is used in the browser.
@@ -1205,6 +1275,74 @@ export abstract class Client {
                 .on("message", (topic, payload) => {
                     this._dispatchMessage(topic, payload);
                 });
+        });
+    }
+
+    // Each generation owns one socket. Fence callbacks before ending it: end/close
+    // can arrive after a replacement has already been requested.
+    private async _recoverTransport() {
+        const generation = ++this._transportGeneration;
+        clearTimeout(this._recoveryTimer);
+        clearTimeout(this._recoveryDeadline);
+        this._emitConnectionStateChange("offline");
+        await this._endRecoveryTransport();
+        if (!this._recovering || generation !== this._transportGeneration) { return; }
+        let url = this.clientOptions.transport.brokerUrl;
+        if (this._isWebPlatform) { url = url.replace(/^mqtt/, "ws"); }
+        let mqtt: Mqtt;
+        const current = () => this._recovering && generation === this._transportGeneration;
+        let failed = false;
+        let deadline: ReturnType<typeof setTimeout>;
+        const fail = () => {
+            if (failed || !current()) { return; }
+            failed = true;
+            clearTimeout(deadline);
+            // Destroy immediately; no socket remains stuck in a kernel connect.
+            this._destroyRecoverySocket(mqtt);
+            mqtt?.end(true);
+            this._emitConnectionStateChange("offline");
+            this._recoveryTimer = setTimeout(() => {
+                if (current()) { this._recoverTransport(); }
+            }, this.clientOptions.transport.reconnectPeriod ?? 1000);
+        };
+        try {
+            mqtt = this._mqtt = connect(url, this._recoveryOptions);
+            deadline = this._recoveryDeadline = setTimeout(fail, this._recoveryOptions.connectTimeout ?? 3000);
+            mqtt.on("error", fail).on("close", fail);
+            mqtt.on("connect", () => {
+                if (!current() || failed) { return; }
+                clearTimeout(deadline);
+                const topics = this._subscriptionManager.getAll();
+                if (topics.length) { mqtt.subscribe(topics); }
+                const resolve = this._initialResolve;
+                this._initialResolve = this._initialReject = undefined;
+                resolve?.();
+                this._emitConnectionStateChange("online");
+            });
+            mqtt.on("message", (topic, payload) => {
+                if (current() && !failed) { this._dispatchMessage(topic, payload); }
+            });
+        } catch {
+            fail();
+        }
+    }
+
+    private _destroyRecoverySocket(mqtt: Mqtt): void {
+        // MQTT.js 4 exposes stream at runtime but omits it from its declarations.
+        (mqtt as Mqtt & { stream?: { destroy(): void } })?.stream?.destroy();
+    }
+
+    private _endRecoveryTransport(): Promise<void> {
+        const mqtt = this._mqtt;
+        if (!mqtt) { return Promise.resolve(); }
+        // Keep the ended client available to offline checks; replace it only when
+        // the next attempt starts. Offline publishes are dropped in recovery mode.
+        return new Promise(resolve => {
+            let timer: ReturnType<typeof setTimeout>;
+            const done = () => { clearTimeout(timer); resolve(); };
+            timer = setTimeout(() => { this._destroyRecoverySocket(mqtt); done(); }, 500);
+            this._destroyRecoverySocket(mqtt);
+            mqtt.end(true, done);
         });
     }
 

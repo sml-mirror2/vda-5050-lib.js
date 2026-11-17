@@ -413,3 +413,23 @@ Code is licensed under the [MIT License](https://opensource.org/licenses/MIT).
 
 Documentation is licensed under a
 [Creative Commons Attribution-ShareAlike 4.0 International License](http://creativecommons.org/licenses/by-sa/4.0/).
+
+### Fixed-package transport recovery
+
+LRApp can opt in with `transport.recoverForever: true`. Configure
+`connectTimeout: 3000`, `reconnectPeriod: 1000`, and `heartbeat: 2` for its
+10-second default recovery target. Initial connection failures and later outages
+are retried indefinitely. `start()` waits for the first successful connection;
+`stop()` also cancels a pending initial connection.
+
+`client.updateBrokerUrl(url)` changes the endpoint while retaining the controller,
+adapter, order/action state, subscriptions, and client ID. This API requires the
+opt-in mode. Superseded transports are destroyed and their callbacks fenced.
+Offline publications in this mode are dropped: the controller publishes fresh
+ONLINE/State after recovery. Subscription registrations survive transport loss.
+The legacy behavior remains the default for other consumers.
+
+Regression checks: `npm run build && node --test test/transport-recovery.cjs`
+(requires a local `mosquitto` binary). Package from the built distribution using
+`cd dist && npm pack --ignore-scripts`; deliver the same tarball to all consumers.
+Keep the fixed master-order anti-stitch and leak corrections when repackaging.
